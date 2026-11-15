@@ -262,13 +262,25 @@ curl http://localhost:8085/health
 
 ### Crawler Tuning
 
-| Variable                      | Default | Description                                                      |
-| :---------------------------- | :------ | :--------------------------------------------------------------- |
-| `CRAWL_TABS_PER_SESSION`      | `8`     | Max concurrent tabs per browser session.                         |
-| `CRAWL_MIN_CONTENT_LENGTH`    | `200`   | Minimum markdown char length to consider a scrape successful.    |
-| `CRAWL_NAVIGATION_TIMEOUT_MS` | `10000` | Timeout for "Fast" scraping mode (ms).                           |
-| `CRAWL_SLOW_TIMEOUT_MS`       | `20000` | Timeout for "Slow" scraping mode (ms).                           |
-| `CRAWL_JITTER_MS`             | `0`     | Max random delay (ms) between requests to avoid thundering herd. |
+Each URL is scraped inside its own isolated browser context (separate cookies
+and page storage, torn down after use) on a pooled browser session. Healthy
+sessions are reused across URLs; a session is recycled only when a scrape that
+ran on it fails.
+
+| Variable                      | Default | Description                                                                       |
+| :---------------------------- | :------ | :-------------------------------------------------------------------------------- |
+| `CRAWL_CONCURRENCY`           | `0`     | Max parallel scrapes for `/crawl`. `0` = match `POOL_SIZE` (one worker/session). |
+| `CRAWL_TOTAL_TIMEOUT_MS`      | `60000` | Overall deadline (ms) for a whole `/crawl` batch, including session waits.       |
+| `SCRAPE_TIMEOUT_MS`           | `30000` | Overall deadline (ms) for a single `/scrape` request.                            |
+| `CRAWL_MIN_CONTENT_LENGTH`    | `200`   | Minimum markdown char length to consider a scrape successful.                    |
+| `CRAWL_NAVIGATION_TIMEOUT_MS` | `10000` | Timeout for "Fast" scraping mode (ms).                                           |
+| `CRAWL_SLOW_TIMEOUT_MS`       | `20000` | Timeout for "Slow" scraping mode (ms).                                           |
+
+`/crawl` results are always returned in SERP order with a per-item `status` of
+`success`, `empty`, or `error` (plus an `error` message), so a single failing
+URL never fails the whole batch or affects another URL's session. Client
+disconnect cancels in-flight work, and every pooled session is released on all
+exit paths.
 
 ## <a name="docker"></a>🐳 Docker
 

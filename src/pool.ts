@@ -27,6 +27,15 @@ export function getPool(): SessionPool {
 }
 
 /**
+ * Replace the singleton pool. Intended for tests that drive the HTTP routes
+ * with an in-memory pool instead of a real Browser.cash connection. Pass
+ * `null` to clear the override.
+ */
+export function __setPoolForTesting(testPool: SessionPool | null): void {
+  pool = testPool;
+}
+
+/**
  * Initialize the browser session pool
  */
 export async function initPool(size: number): Promise<SessionPool> {

@@ -1,7 +1,14 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 
 const DEBUG_LOG = process.env.DEBUG_LOG === '1' || process.env.DEBUG_LOG === 'true';
-const SERP_SERVICE_URL = process.env.SERP_SERVICE_URL || 'http://localhost:8080';
+
+/**
+ * Resolve the upstream SERP base URL at call time so tests (and runtime env
+ * changes) can point it at a local stub without re-importing the module.
+ */
+function serpServiceUrl(): string {
+  return process.env.SERP_SERVICE_URL || 'http://localhost:8080';
+}
 
 interface SerpResult {
   url?: string;
@@ -23,7 +30,7 @@ interface SerpRequestBody {
  * Query the upstream SERP service for search results
  */
 export async function runSerpQuery(query: string, count = 5): Promise<SerpResult[]> {
-  const response = await fetch(`${SERP_SERVICE_URL}/api/v1/search`, {
+  const response = await fetch(`${serpServiceUrl()}/api/v1/search`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ q: query, count }),

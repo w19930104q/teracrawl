@@ -2,6 +2,7 @@ import type { Browser, Page, BrowserContext } from 'playwright-core';
 import { loadEnvNumber } from './env.js';
 import { parseHtmlToMarkdown } from './markdown.js';
 import { isPdfUrl, convertPdfToMarkdown, isPdfSupportEnabled } from './pdf.js';
+import { AbortError, isAbortError, raceWithSignal } from './abort.js';
 
 // Re-export PDF utilities for direct access
 export { isPdfUrl, convertPdfToMarkdown, isPdfSupportEnabled } from './pdf.js';
@@ -25,15 +26,17 @@ const CONTENT_SELECTORS = [
   '.main',
 ];
 
-// Track contexts with route blocking already configured
-const configuredContexts = new WeakSet<BrowserContext>();
-
 export interface CrawlResult {
   url: string;
   title: string;
   markdown: string;
   status: 'success' | 'empty' | 'error';
   error?: string;
+}
+
+export interface ScrapeOptions {
+  /** Cancellation/deadline signal for the whole scrape (fast + slow fallback). */
+  signal?: AbortSignal;
 }
 
 /**
@@ -85,11 +88,12 @@ async function extractContentAndTitle(page: Page): Promise<{ content: string; ti
 }
 
 /**
- * Configure route blocking on context (called once per context)
+ * Configure route blocking on a freshly created context.
+ *
+ * Every scrape now gets its own BrowserContext, so there is nothing to cache
+ * the routing on — the handler is simply attached once per context.
  */
 async function ensureRouteBlocking(context: BrowserContext, blockStylesheets: boolean): Promise<void> {
-  if (configuredContexts.has(context)) return;
-
   const blockedTypes = blockStylesheets
     ? ['image', 'font', 'stylesheet', 'media']
     : ['image', 'font', 'media'];
@@ -101,8 +105,6 @@ async function ensureRouteBlocking(context: BrowserContext, blockStylesheets: bo
     }
     return route.continue();
   });
-
-  configuredContexts.add(context);
 }
 
 /**
@@ -134,35 +136,96 @@ async function closeContext(context: BrowserContext | null, url: string): Promis
 }
 
 /**
- * 
- *  scraper - optimized for static/SSR pages
- * 
- * - Reuses existing browser context when available
+ * Build an error result for a URL. Cancellation/timeout errors keep their
+ * message so callers can distinguish them from ordinary scrape failures.
+ */
+function errorResult(url: string, err: unknown): CrawlResult {
+  const message = err instanceof Error ? err.message : String(err);
+  return { url, title: '', markdown: '', status: 'error', error: message };
+}
+
+/**
+ * Throw an AbortError carrying the signal's own reason (if it is an Error) so
+ * cancellation messages from callers — e.g. "client disconnected" — survive.
+ */
+function throwIfAborted(signal: AbortSignal | undefined, phase: string): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  if (reason instanceof Error) {
+    throw new AbortError(reason.message);
+  }
+  throw new AbortError(`${phase} aborted`);
+}
+
+/**
+ * Result-shaped counterpart of throwIfAborted for phases that return results
+ * instead of throwing (the fallback orchestrator).
+ */
+function abortResult(url: string, signal: AbortSignal, phase: string): CrawlResult {
+  const reason = signal.reason;
+  const message = reason instanceof Error ? reason.message : `${phase} aborted`;
+  return { url, title: '', markdown: '', status: 'error', error: message };
+}
+
+/**
+ * Bridge an AbortSignal to page lifetime: when the signal aborts, the page is
+ * closed, which rejects any in-flight Playwright operation (goto, evaluate,
+ * waitForFunction...) instead of waiting for its own navigation timeout.
+ *
+ * Returns a detach function for normal completion; all cleanup errors are
+ * swallowed because the finally block closes the page/context anyway.
+ */
+function abortPageOnSignal(page: Page, signal: AbortSignal | undefined, url: string): () => void {
+  if (!signal) return () => undefined;
+
+  if (signal.aborted) {
+    void page.close().catch(() => undefined);
+    return () => undefined;
+  }
+
+  const onAbort = () => {
+    if (DEBUG_LOG) {
+      console.warn(`[scraper] Abort signal received, closing page for ${url}`);
+    }
+    void page.close().catch(() => undefined);
+  };
+  signal.addEventListener('abort', onAbort, { once: true });
+  return () => signal.removeEventListener('abort', onAbort);
+}
+
+/**
+ * Fast scraper - optimized for static/SSR pages
+ *
+ * - Always creates a fresh, isolated BrowserContext (no shared cookies/storage)
  * - Blocks heavy assets (images, fonts, stylesheets)
  * - Waits only for 'domcontentloaded' then extracts immediately
+ * - The context (and its page) is always closed, even on cancellation
  */
-export async function scrapeUrlFast(browser: Browser, url: string): Promise<CrawlResult> {
+export async function scrapeUrlFast(
+  browser: Browser,
+  url: string,
+  options: ScrapeOptions = {}
+): Promise<CrawlResult> {
+  const { signal } = options;
   const scrapeStart = performance.now();
   console.log(`\x1b[35m[SCRAPER]\x1b[0m Starting scrape: ${url}`);
 
   let context: BrowserContext | null = null;
-  let createdContext = false;
   let page: Page | null = null;
+  let detachAbort: (() => void) | null = null;
 
   try {
+    throwIfAborted(signal, 'scrape');
+
     const contextStart = performance.now();
 
-    // Reuse existing context if available, otherwise create new
-    const existingContexts = browser.contexts();
-    if (existingContexts.length > 0) {
-      context = existingContexts[0];
-    } else {
-      context = await browser.newContext();
-      createdContext = true;
-    }
-
+    // Fresh context per scrape: cookies, localStorage and sessionStorage are
+    // scoped to this context and destroyed with it, so concurrent/sequential
+    // scrapes on the same browser session can never pollute each other.
+    context = await browser.newContext();
     await ensureRouteBlocking(context, true);
     page = await context.newPage();
+    detachAbort = abortPageOnSignal(page, signal, url);
     logPerf('Page created', url, contextStart);
 
     // Navigate and extract content
@@ -183,40 +246,51 @@ export async function scrapeUrlFast(browser: Browser, url: string): Promise<Craw
     }
     return { url, title: '', markdown: '', status: 'empty' };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logPerf('FAST ERROR', url, scrapeStart, { error: message });
+    if (isAbortError(err)) {
+      logPerf('FAST ABORTED', url, scrapeStart, { error: (err as Error).message });
+    } else {
+      const message = err instanceof Error ? err.message : String(err);
+      logPerf('FAST ERROR', url, scrapeStart, { error: message });
 
-    if (DEBUG_LOG) {
-      console.error(`[scraper:fast] Failed ${url}:`, message);
+      if (DEBUG_LOG) {
+        console.error(`[scraper:fast] Failed ${url}:`, message);
+      }
     }
-
-    return { url, title: '', markdown: '', status: 'error', error: message };
+    return errorResult(url, err);
   } finally {
+    detachAbort?.();
     await closePage(page, url);
-    if (createdContext) {
-      await closeContext(context, url);
-    }
+    await closeContext(context, url);
   }
 }
 
 /**
  * Slow scraper - fallback for SPAs and dynamic content
- * 
- * - Creates fresh context for isolation
+ *
+ * - Creates a fresh isolated context per scrape
  * - Waits for full page load
  * - Waits for content to render
  * - Less aggressive asset blocking (allows stylesheets)
  */
-export async function scrapeUrlSlow(browser: Browser, url: string): Promise<CrawlResult> {
+export async function scrapeUrlSlow(
+  browser: Browser,
+  url: string,
+  options: ScrapeOptions = {}
+): Promise<CrawlResult> {
+  const { signal } = options;
   const scrapeStart = performance.now();
   let context: BrowserContext | null = null;
   let page: Page | null = null;
+  let detachAbort: (() => void) | null = null;
 
   try {
+    throwIfAborted(signal, 'scrape');
+
     const contextStart = performance.now();
     context = await browser.newContext();
     await ensureRouteBlocking(context, false);
     page = await context.newPage();
+    detachAbort = abortPageOnSignal(page, signal, url);
     logPerf('Context created', url, contextStart);
 
     // Navigate with full load
@@ -224,7 +298,8 @@ export async function scrapeUrlSlow(browser: Browser, url: string): Promise<Craw
     await page.goto(url, { waitUntil: 'load', timeout: SLOW_TIMEOUT_MS });
     logPerf('Navigation done', url, navStart);
 
-    // Wait for content to render
+    // Wait for content to render. An abort during the wait closes the page
+    // (see abortPageOnSignal), which rejects this call — rethrow in that case.
     try {
       await page.waitForFunction(
         (minLen: number) => {
@@ -234,12 +309,17 @@ export async function scrapeUrlSlow(browser: Browser, url: string): Promise<Craw
         MIN_CONTENT_LENGTH,
         { timeout: 10000 }
       );
-    } catch {
-      // Content may still be usable even if wait times out
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        throw new AbortError('scrape aborted while waiting for content');
+      }
+      // Content may still be usable even if the wait times out
       if (DEBUG_LOG) {
         console.warn(`[scraper:slow] Content wait timed out for ${url}`);
       }
     }
+
+    if (signal?.aborted) throwIfAborted(signal, 'content extraction');
 
     const extractStart = performance.now();
     const { content, title } = await extractContentAndTitle(page);
@@ -254,15 +334,19 @@ export async function scrapeUrlSlow(browser: Browser, url: string): Promise<Craw
     }
     return { url, title, markdown, status: 'empty' };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logPerf('SLOW ERROR', url, scrapeStart, { error: message });
+    if (isAbortError(err)) {
+      logPerf('SLOW ABORTED', url, scrapeStart, { error: (err as Error).message });
+    } else {
+      const message = err instanceof Error ? err.message : String(err);
+      logPerf('SLOW ERROR', url, scrapeStart, { error: message });
 
-    if (DEBUG_LOG) {
-      console.error(`[scraper:slow] Failed ${url}:`, message);
+      if (DEBUG_LOG) {
+        console.error(`[scraper:slow] Failed ${url}:`, message);
+      }
     }
-
-    return { url, title: '', markdown: '', status: 'error', error: message };
+    return errorResult(url, err);
   } finally {
+    detachAbort?.();
     await closePage(page, url);
     await closeContext(context, url);
   }
@@ -270,11 +354,19 @@ export async function scrapeUrlSlow(browser: Browser, url: string): Promise<Craw
 
 /**
  * Scrape with automatic fallback
- * 
+ *
  * Checks if URL is a PDF and uses Datalab Marker API for conversion (if API key is configured).
  * For regular URLs, tries fast scraper first, falls back to slow scraper if fast returns empty/error.
+ *
+ * When `options.signal` aborts, no new phase is started and the in-flight
+ * scrape returns an error result whose `error` describes the cancellation.
  */
-export async function scrapeUrlWithFallback(browser: Browser, url: string): Promise<CrawlResult> {
+export async function scrapeUrlWithFallback(
+  browser: Browser,
+  url: string,
+  options: ScrapeOptions = {}
+): Promise<CrawlResult> {
+  const { signal } = options;
   const startTime = performance.now();
 
   // Handle PDF URLs with Datalab Marker API
@@ -289,21 +381,35 @@ export async function scrapeUrlWithFallback(browser: Browser, url: string): Prom
         error: 'PDF URLs require DATALAB_API_KEY to be configured',
       };
     }
+    if (signal?.aborted) {
+      return abortResult(url, signal, 'PDF conversion');
+    }
     console.log(`\x1b[36m[PDF]\x1b[0m Detected PDF URL, using Marker API: ${url}`);
-    const pdfResult = await convertPdfToMarkdown(url);
+    const pdfResult = signal
+      ? await raceWithSignal(convertPdfToMarkdown(url), signal, 'pdf conversion')
+      : await convertPdfToMarkdown(url);
     logPerf('PDF CONVERSION', url, startTime, { status: pdfResult.status });
     return pdfResult;
   }
 
-  const fast = await scrapeUrlFast(browser, url);
+  if (signal?.aborted) {
+    return abortResult(url, signal, 'fast phase');
+  }
+
+  const fast = await scrapeUrlFast(browser, url, { signal });
   if (fast.status === 'success') {
     logPerf('WITH FALLBACK', url, startTime, { method: 'fast', status: 'success' });
     return fast;
   }
 
+  // Do not burn a second browser attempt after cancellation/timeout.
+  if (signal?.aborted) {
+    return abortResult(url, signal, 'slow fallback');
+  }
+
   // Try slow scraper as fallback
   console.log(`\x1b[35m[SCRAPER]\x1b[0m Fast scrape incomplete, trying slow method: ${url}`);
-  const slow = await scrapeUrlSlow(browser, url);
+  const slow = await scrapeUrlSlow(browser, url, { signal });
   logPerf('WITH FALLBACK', url, startTime, { method: 'slow', status: slow.status });
 
   return slow;
